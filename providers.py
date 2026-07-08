@@ -1,23 +1,23 @@
 """
-Data provider layer (Financial Modeling Prep).
+Data provider layer — Financial Modeling Prep, NEW "stable" API.
 
-Everything else talks to this through a small surface:
-    get_metrics(symbol)        -> per-stock fundamentals + profile (sector, beta, ...)
-    get_price_changes(symbol)  -> 3M / 6M / 12M price change windows
-    get_history(symbol)        -> chronological closes (regime trend / vol / returns)
-    get_treasury()             -> latest 2Y / 10Y yields (yield-curve signal)
-    get_quote(symbol)          -> live quote
-    get_peers(symbol)          -> close industry peers (optional sector-relative mode)
-    get_sector_pe()            -> sector median P/E benchmarks
+FMP retired its /api/v3 and /api/v4 paths for accounts created after Aug 2025.
+This provider targets the current API at:
 
-Production-grade rules:
-- Every endpoint call is isolated and returns None on any failure (plan gating, 4xx,
-  timeout, bad JSON). A missing metric drops out of its factor; nothing crashes.
-- Same-day disk cache keyed on (endpoint, symbol): re-runs and slider moves never
-  re-bill your quota within a day.
-- Retry/backoff with 429 (rate-limit) awareness.
+    https://financialmodelingprep.com/stable/<endpoint>?symbol=XXX&apikey=KEY
 
-Swapping vendors = reimplement this one class with the same method signatures.
+Robustness features (why the app won't crash even if FMP shuffles things again):
+- Each data need has a LIST of candidate endpoints, tried in order; the first one
+  that returns usable data wins and is remembered for the rest of the run.
+- Field names are looked up by alias lists (e.g. "netProfitMarginTTM" OR
+  "netProfitMargin"), so renamed columns degrade to other aliases, not crashes.
+- Any endpoint the plan doesn't cover returns None -> the metric simply drops out
+  of its factor. Same-day disk cache, retries, and 429 rate-limit backoff included.
+
+Public surface (unchanged — nothing else in the app needs edits):
+    get_metrics(symbol), get_price_changes(symbol), get_history(symbol),
+    get_price_series(symbol), get_treasury(), get_quote(symbol),
+    get_peers(symbol), get_sector_pe()
 """
 
 from __future__ import annotations
@@ -29,32 +29,27 @@ from pathlib import Path
 
 import requests
 
-V3 = "https://financialmodelingprep.com/api/v3"
-V4 = "https://financialmodelingprep.com/api/v4"
+STABLE = "https://financialmodelingprep.com/stable"
 
 
 class FMPProvider:
-    def __init__(self, api_key: str, cache_dir: str = ".cache", delay: float = 0.2):
+    def __init__(self, api_key: str, cache_dir: str = ".cache", delay: float = 0.15):
         if not api_key:
-            raise ValueError("No FMP API key. Set FMP_API_KEY in .env or paste one in the app.")
+            raise ValueError("No FMP API key. Set FMP_API_KEY in Secrets/.env or paste one in the app.")
         self.api_key = api_key
         self.delay = delay
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
         self.session = requests.Session()
+        self._winner: dict[str, str] = {}  # data-need -> endpoint that worked
 
     # ---- low level ---------------------------------------------------------
     def _cache_path(self, tag: str) -> Path:
         safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in tag)
         return self.cache_dir / f"{date.today().isoformat()}__{safe}.json"
 
-    def _get(self, url: str, params: dict, tag: str):
-        cp = self._cache_path(tag)
-        if cp.exists():
-            try:
-                return json.loads(cp.read_text())
-            except Exception:
-                pass
+    def _http(self, endpoint: str, params: dict):
+        url = f"{STABLE}/{endpoint}"
         params = {**params, "apikey": self.api_key}
         for attempt in range(3):
             try:
@@ -62,15 +57,39 @@ class FMPProvider:
                 if r.status_code == 429:
                     time.sleep(2 + 2 * attempt)
                     continue
-                if r.status_code in (401, 402, 403):
+                if r.status_code in (401, 402, 403, 404):
                     return None
                 r.raise_for_status()
                 data = r.json()
-                cp.write_text(json.dumps(data))
+                # FMP signals plan/endpoint problems inside 200 bodies too
+                if isinstance(data, dict) and any(k for k in data if "rror" in k):
+                    return None
                 time.sleep(self.delay)
                 return data
             except Exception:
-                time.sleep(1 + attempt)
+                time.sleep(0.8 + attempt)
+        return None
+
+    def _get_any(self, need: str, candidates: list[str], params: dict, tag: str):
+        """Try candidate endpoints in order; cache result per day; remember the winner."""
+        cp = self._cache_path(tag)
+        if cp.exists():
+            try:
+                return json.loads(cp.read_text())
+            except Exception:
+                pass
+        order = candidates
+        if need in self._winner and self._winner[need] in candidates:
+            order = [self._winner[need]] + [c for c in candidates if c != self._winner[need]]
+        for ep in order:
+            data = self._http(ep, params)
+            if data not in (None, [], {}):
+                self._winner[need] = ep
+                try:
+                    cp.write_text(json.dumps(data))
+                except Exception:
+                    pass
+                return data
         return None
 
     @staticmethod
@@ -92,89 +111,109 @@ class FMPProvider:
                     continue
         return None
 
-    # ---- endpoint fetchers -------------------------------------------------
-    def _ratios(self, s):     return self._first(self._get(f"{V3}/ratios-ttm/{s}", {}, f"ratios-ttm-{s}"))
-    def _keymetrics(self, s): return self._first(self._get(f"{V3}/key-metrics-ttm/{s}", {}, f"key-metrics-ttm-{s}"))
-    def _growth(self, s):     return self._first(self._get(f"{V3}/financial-growth/{s}", {"period": "annual", "limit": 1}, f"growth-{s}"))
-    def _profile(self, s):    return self._first(self._get(f"{V3}/profile/{s}", {}, f"profile-{s}"))
-    def _pxchange(self, s):   return self._first(self._get(f"{V3}/stock-price-change/{s}", {}, f"pxchg-{s}"))
+    # ---- fetchers (new stable endpoints, with fallbacks) --------------------
+    def _profile(self, s):
+        return self._first(self._get_any("profile", ["profile"], {"symbol": s}, f"profile-{s}"))
+
+    def _ratios(self, s):
+        return self._first(self._get_any("ratios", ["ratios-ttm"], {"symbol": s}, f"ratios-{s}"))
+
+    def _keymetrics(self, s):
+        return self._first(self._get_any("keymetrics", ["key-metrics-ttm"], {"symbol": s}, f"km-{s}"))
+
+    def _growth(self, s):
+        return self._first(self._get_any(
+            "growth", ["financial-growth", "financial-statement-growth", "income-statement-growth"],
+            {"symbol": s, "period": "annual", "limit": 1}, f"growth-{s}"))
 
     def _scores(self, s):
-        d = self._get(f"{V4}/score", {"symbol": s}, f"score-{s}")
-        if not d:
-            d = self._get(f"{V3}/score/{s}", {}, f"scorev3-{s}")
-        return self._first(d)
+        return self._first(self._get_any("scores", ["financial-scores"], {"symbol": s}, f"scores-{s}"))
 
-    def _fwd_eps(self, s):
-        data = self._get(f"{V3}/analyst-estimates/{s}", {"period": "annual", "limit": 6}, f"estimates-{s}")
-        if not isinstance(data, list):
-            return None
-        yr, fut = date.today().year, []
-        for row in data:
-            try:
-                y = int(str((row or {}).get("date", ""))[:4])
-            except ValueError:
-                continue
-            eps = self._num(row, "estimatedEpsAvg")
-            if y >= yr and eps is not None:
-                fut.append((y, eps))
-        fut.sort()
-        return fut[0][1] if fut else None
+    def _pxchange(self, s):
+        return self._first(self._get_any("pxchg", ["stock-price-change"], {"symbol": s}, f"pxchg-{s}"))
 
-    def _grade_net(self, s):
-        data = self._get(f"{V3}/grade/{s}", {"limit": 25}, f"grade-{s}")
-        if not isinstance(data, list):
-            return None
-        rank = {"strong sell": 0, "sell": 1, "underperform": 1, "underweight": 1, "reduce": 1,
-                "neutral": 2, "hold": 2, "equal-weight": 2, "market perform": 2, "in-line": 2,
-                "overweight": 3, "outperform": 3, "buy": 3, "accumulate": 3, "positive": 3,
-                "strong buy": 4}
-        net = 0.0
-        for row in data[:20]:
-            n = str(row.get("newGrade", "")).strip().lower()
-            o = str(row.get("previousGrade", "")).strip().lower()
-            if n in rank and o in rank:
-                net += 1 if rank[n] > rank[o] else (-1 if rank[n] < rank[o] else 0)
-        return net
+    def _estimates(self, s):
+        return self._get_any("estimates", ["analyst-estimates"],
+                             {"symbol": s, "period": "annual", "limit": 6, "page": 0}, f"est-{s}")
+
+    def _grades(self, s):
+        return self._get_any("grades", ["grades", "grades-historical", "grades-latest-news"],
+                             {"symbol": s, "limit": 25}, f"grades-{s}")
 
     # ---- public: per-stock fundamentals ------------------------------------
     def get_metrics(self, sym: str) -> dict:
         s = sym.upper().strip()
-        r, k, g, p, sc = (self._ratios(s), self._keymetrics(s), self._growth(s),
-                          self._profile(s), self._scores(s))
+        p, r, k, g, sc = (self._profile(s), self._ratios(s), self._keymetrics(s),
+                          self._growth(s), self._scores(s))
+
+        fwd_eps = None
+        est = self._estimates(s)
+        if isinstance(est, list):
+            yr, fut = date.today().year, []
+            for row in est:
+                d = str((row or {}).get("date", "")) or str((row or {}).get("fiscalYear", ""))
+                try:
+                    y = int(d[:4])
+                except ValueError:
+                    continue
+                eps = self._num(row, "estimatedEpsAvg", "epsAvg", "epsEstimatedAvg", "epsEstimated")
+                if y >= yr and eps is not None:
+                    fut.append((y, eps))
+            fut.sort()
+            fwd_eps = fut[0][1] if fut else None
+
+        grade_net = None
+        gr = self._grades(s)
+        if isinstance(gr, list) and gr:
+            rank = {"strong sell": 0, "sell": 1, "underperform": 1, "underweight": 1, "reduce": 1,
+                    "neutral": 2, "hold": 2, "equal-weight": 2, "market perform": 2, "in-line": 2,
+                    "overweight": 3, "outperform": 3, "buy": 3, "accumulate": 3, "positive": 3,
+                    "strong buy": 4}
+            net = 0.0
+            seen = False
+            for row in gr[:20]:
+                n = str(row.get("newGrade", "")).strip().lower()
+                o = str(row.get("previousGrade", "")).strip().lower()
+                if n in rank and o in rank:
+                    seen = True
+                    net += 1 if rank[n] > rank[o] else (-1 if rank[n] < rank[o] else 0)
+            grade_net = net if seen else None
+
         return {
             "name": (p.get("companyName") if p else None) or s,
             "sector": (p.get("sector") if p else None) or "Unknown",
             "industry": (p.get("industry") if p else None) or "Unknown",
             "beta": self._num(p, "beta"),
             "price": self._num(p, "price"),
-            "mktcap": self._num(p, "mktCap", "marketCap"),
+            "mktcap": self._num(p, "marketCap", "mktCap"),
             # value
-            "pe": self._num(r, "peRatioTTM", "priceEarningsRatioTTM"),
+            "pe": self._num(r, "priceToEarningsRatioTTM", "peRatioTTM", "priceEarningsRatioTTM"),
             "ps": self._num(r, "priceToSalesRatioTTM"),
             "pb": self._num(r, "priceToBookRatioTTM"),
-            "p_fcf": self._num(r, "priceToFreeCashFlowsRatioTTM"),
-            "ev_ebitda": self._num(k, "enterpriseValueOverEBITDATTM"),
+            "p_fcf": self._num(r, "priceToFreeCashFlowRatioTTM", "priceToFreeCashFlowsRatioTTM"),
+            "ev_ebitda": self._num(k, "evToEBITDATTM", "enterpriseValueOverEBITDATTM",
+                                   "enterpriseValueMultipleTTM") or
+                         self._num(r, "enterpriseValueMultipleTTM"),
             # growth
-            "rev_growth": self._num(g, "revenueGrowth"),
-            "eps_growth": self._num(g, "epsgrowth", "epsdilutedGrowth"),
-            "fcf_growth": self._num(g, "freeCashFlowGrowth"),
+            "rev_growth": self._num(g, "revenueGrowth", "growthRevenue"),
+            "eps_growth": self._num(g, "epsgrowth", "epsGrowth", "growthEPS", "epsdilutedGrowth"),
+            "fcf_growth": self._num(g, "freeCashFlowGrowth", "growthFreeCashFlow"),
             # profitability
-            "net_margin": self._num(r, "netProfitMarginTTM"),
+            "net_margin": self._num(r, "netProfitMarginTTM", "netIncomeMarginTTM"),
             "gross_margin": self._num(r, "grossProfitMarginTTM"),
-            "roe": self._num(r, "returnOnEquityTTM"),
-            "roic": self._num(k, "roicTTM"),
+            "roe": self._num(r, "returnOnEquityTTM") or self._num(k, "returnOnEquityTTM"),
+            "roic": self._num(k, "returnOnInvestedCapitalTTM", "roicTTM"),
             "fcf_yield": self._num(k, "freeCashFlowYieldTTM"),
             # quality / financial health
             "piotroski": self._num(sc, "piotroskiScore"),
             "altman_z": self._num(sc, "altmanZScore"),
-            "debt_equity": self._num(r, "debtEquityRatioTTM", "debtToEquityTTM"),
+            "debt_equity": self._num(r, "debtToEquityRatioTTM", "debtEquityRatioTTM"),
             "current_ratio": self._num(r, "currentRatioTTM"),
-            "interest_cov": self._num(r, "interestCoverageTTM"),
+            "interest_cov": self._num(r, "interestCoverageRatioTTM", "interestCoverageTTM"),
             # revisions
-            "fwd_eps": self._fwd_eps(s),
-            "ttm_eps": self._num(r, "netIncomePerShareTTM", "epsTTM"),
-            "grade_net": self._grade_net(s),
+            "fwd_eps": fwd_eps,
+            "ttm_eps": self._num(r, "netIncomePerShareTTM", "epsTTM") or self._num(k, "netIncomePerShareTTM"),
+            "grade_net": grade_net,
         }
 
     def get_price_changes(self, sym: str) -> dict:
@@ -182,50 +221,68 @@ class FMPProvider:
         return {"px_3m": self._num(p, "3M"), "px_6m": self._num(p, "6M"),
                 "px_12m": self._num(p, "1Y")}
 
-    # ---- public: history ---------------------------------------------------
-    def get_history(self, sym: str, days: int = 260):
-        data = self._get(f"{V3}/historical-price-full/{sym.upper()}",
-                         {"timeseries": days}, f"hist-{sym}-{days}")
-        hist = data.get("historical", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-        closes = [self._num(row, "close", "adjClose") for row in hist]
-        closes = [c for c in closes if c is not None]
-        closes.reverse()  # newest-first -> chronological
-        return closes
+    # ---- public: price history ----------------------------------------------
+    def _history_rows(self, s, days):
+        frm = (date.today() - timedelta(days=int(days * 1.5))).isoformat()
+        data = self._get_any("history", ["historical-price-eod/light", "historical-price-eod/full"],
+                             {"symbol": s, "from": frm, "to": date.today().isoformat()},
+                             f"hist-{s}-{days}")
+        if isinstance(data, dict):
+            data = data.get("historical", [])
+        return data if isinstance(data, list) else []
 
-    # ---- public: macro -----------------------------------------------------
+    def get_history(self, sym: str, days: int = 260):
+        rows = self._history_rows(sym.upper().strip(), days)
+        out = []
+        for row in rows:
+            c = self._num(row, "close", "price", "adjClose")
+            if c is not None:
+                out.append((str(row.get("date", "")), c))
+        out.sort()  # chronological regardless of API order
+        return [c for _, c in out][-days:]
+
+    def get_price_series(self, sym: str, days: int = 1100) -> dict:
+        rows = self._history_rows(sym.upper().strip(), days)
+        series = {}
+        for row in rows:
+            d, c = row.get("date"), self._num(row, "close", "price", "adjClose")
+            if d and c is not None:
+                series[str(d)] = c
+        return series
+
+    # ---- public: macro -------------------------------------------------------
     def get_treasury(self):
         today = date.today()
-        d = self._get(f"{V4}/treasury",
-                      {"from": (today - timedelta(days=12)).isoformat(), "to": today.isoformat()},
-                      "treasury")
-        row = d[0] if isinstance(d, list) and d else {}
+        d = self._get_any("treasury", ["treasury-rates"],
+                          {"from": (today - timedelta(days=14)).isoformat(),
+                           "to": today.isoformat()}, "treasury")
+        rows = d if isinstance(d, list) else []
+        row = rows[0] if rows else {}
+        # rows may be oldest-first; take the latest date
+        if len(rows) > 1:
+            try:
+                row = max(rows, key=lambda r: str(r.get("date", "")))
+            except Exception:
+                pass
         return {"y2": self._num(row, "year2", "month2"), "y10": self._num(row, "year10")}
 
     def get_quote(self, sym: str):
-        return self._first(self._get(f"{V3}/quote/{sym.upper()}", {}, f"quote-{sym}"))
+        return self._first(self._get_any("quote", ["quote"], {"symbol": sym.upper()}, f"quote-{sym}"))
 
-    def get_price_series(self, sym: str, days: int = 1100) -> dict:
-        """{date_str: close} for backtesting. Deep history; cached daily."""
-        data = self._get(f"{V3}/historical-price-full/{sym.upper()}",
-                         {"timeseries": days}, f"hist-{sym}-{days}")
-        hist = data.get("historical", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-        out = {}
-        for row in hist:
-            d, c = row.get("date"), self._num(row, "close", "adjClose")
-            if d and c is not None:
-                out[d] = c
-        return out
-
-    # ---- public: sector-relative helpers -----------------------------------
+    # ---- public: sector-relative helpers --------------------------------------
     def get_peers(self, sym: str):
-        d = self._get(f"{V4}/stock_peers", {"symbol": sym.upper()}, f"peers-{sym}")
-        if isinstance(d, list) and d and isinstance(d[0], dict):
-            return [p.upper() for p in d[0].get("peersList", [])]
+        d = self._get_any("peers", ["stock-peers"], {"symbol": sym.upper()}, f"peers-{sym}")
+        if isinstance(d, list) and d:
+            if isinstance(d[0], dict) and "peersList" in d[0]:
+                return [p.upper() for p in d[0].get("peersList", [])]
+            if isinstance(d[0], dict) and "symbol" in d[0]:
+                me = sym.upper()
+                return [row["symbol"].upper() for row in d if row.get("symbol") and row["symbol"].upper() != me]
         return []
 
     def get_sector_pe(self):
-        d = self._get(f"{V4}/sector_price_earning_ratio",
-                      {"date": date.today().isoformat(), "exchange": "NYSE"}, "sectorpe")
+        d = self._get_any("sectorpe", ["sector-pe-snapshot"],
+                          {"date": date.today().isoformat(), "exchange": "NYSE"}, "sectorpe")
         out = {}
         if isinstance(d, list):
             for row in d:
