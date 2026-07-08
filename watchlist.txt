@@ -1,0 +1,9 @@
+# One ticker per line. Text after # is ignored.
+# Grades are sharpest when the list is sector-coherent (or use --sector mode).
+AMZN
+HIVE
+RXT
+ICHR
+MCHP
+FRO
+GTY
