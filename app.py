@@ -283,6 +283,20 @@ with bc2.expander("Forward validation of the full composite"):
                 st.dataframe(pd.DataFrame(v["per_run"]), hide_index=True, use_container_width=True)
             st.caption(v["note"])
 
+# ---- data diagnostics ----
+with st.expander("🔧 Data diagnostics — what is FMP returning?"):
+    st.caption("Hits each FMP endpoint once from this server and reports the outcome. "
+               "Use this if grades look flat or data seems missing.")
+    if st.button("Run diagnostics"):
+        with st.spinner("Testing endpoints…"):
+            try:
+                report = FMPProvider(key).diagnose(tickers[0] if tickers else "AAPL")
+                ddf = pd.DataFrame([{"Endpoint": ep, "Status": v["status"],
+                                     "Sample fields": v["fields"]} for ep, v in report.items()])
+                st.dataframe(ddf, hide_index=True, use_container_width=True)
+            except Exception as e:
+                st.error(f"Diagnostics failed: {e}")
+
 # ---- save snapshot once per fetch ----
 if st.session_state.get("save_pending"):
     try:
