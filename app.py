@@ -90,7 +90,7 @@ def parse_watchlist(text):
 
 def style_grades(df):
     cols = [c for c in df.columns if c == "Grade" or c in FACTOR_ORDER]
-    return df.style.applymap(
+    return df.style.map(
         lambda v: f"background-color:{GRADE_BG.get(v,'')};color:white;font-weight:600;"
         if v in GRADE_BG else "", subset=cols)
 
